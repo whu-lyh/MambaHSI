@@ -1,7 +1,9 @@
 import warnings
+
 import torch.nn.functional as F
 
 
+# Inspired from the mmsegmentation library
 def resize(input,
            size=None,
            scale_factor=None,
@@ -24,12 +26,12 @@ def resize(input,
     return F.interpolate(input, size, scale_factor, mode, align_corners)
 
 
-def head_loss(loss_func,logits,label,align_corners=True):
+def head_loss(loss_func, logits, label, align_corners=True):
     seg_logits = resize(
         input=logits,
         size=label.shape[1:],
         mode='bilinear',
         align_corners=align_corners)
 
-    loss = loss_func(seg_logits,label)
+    loss = loss_func(seg_logits, label)
     return loss

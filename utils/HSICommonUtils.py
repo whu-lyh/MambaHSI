@@ -1,15 +1,23 @@
-import torch
 import numpy as np
+import torch
 from torchvision import transforms
 
 
 def ImageStretching(image):
+    """normalize the band data
+
+    Args:
+        image (np.array): raw hyperspectral image data
+
+    Returns:
+        np.array: _description_
+    """
     channels = image.shape[2]
     band_list = []
     for i in range(channels):
         band_data = image[:,:,i]
-        band_min = np.percentile(band_data,2)
-        band_max = np.percentile(band_data,98)
+        band_min = np.percentile(band_data, 2)
+        band_max = np.percentile(band_data, 98)
         band_data = (band_data - band_min) / (band_max - band_min)
         # plt.imshow(band_data)
         # plt.show()

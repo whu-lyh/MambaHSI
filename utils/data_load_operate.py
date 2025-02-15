@@ -1,10 +1,12 @@
 import os
-import torch
+
 import numpy as np
 import scipy.io as sio
+import torch
 import torch.utils.data as Data
 from sklearn import preprocessing
 from sklearn.decomposition import PCA
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -36,7 +38,6 @@ def standardization(data):
     height, width, bands = data.shape
     data = np.reshape(data, [height * width, bands])
     data = preprocessing.StandardScaler().fit_transform(data)
-
     data = np.reshape(data, [height, width, bands])
     return data
 
@@ -52,6 +53,7 @@ def sampling(ratio_list, num_list, gt_reshape, class_count, Flag):
     all_label_index_list, train_label_index_list, val_label_index_list, test_label_index_list = [], [], [], []
 
     for cls in range(class_count):
+        # get labels from each category
         cls_index = np.where(gt_reshape == cls + 1)[0]
         all_label_index_dict[cls] = list(cls_index)
 
@@ -239,9 +241,9 @@ def generate_auxilary_iter(data_padded, hsi_h, hsi_w, label_reshape, aux_index, 
     return aux_iter
 
 
-def generate_image_iter(data_padded, hsi_h, hsi_w, label_reshape, index):
+def generate_image_iter(hsi_h, hsi_w, label_reshape, index):
     def generate_label_map(num, hsi_w):
-        num =np.array(num)
+        num = np.array(num)
         idx_2d = np.zeros([num.shape[0], 2]).astype(int)
         idx_2d[:, 0] = num // hsi_w
         idx_2d[:, 1] = num % hsi_w
@@ -254,12 +256,9 @@ def generate_image_iter(data_padded, hsi_h, hsi_w, label_reshape, index):
     train_labels = generate_label_map(index[0], hsi_w) - 1
     val_labels = generate_label_map(index[1], hsi_w) - 1
     test_labels = generate_label_map(index[2], hsi_w) - 1
-
-
     y_tensor_train = torch.from_numpy(train_labels).type(torch.FloatTensor)
     y_tensor_val = torch.from_numpy(val_labels).type(torch.FloatTensor)
     y_tensor_test = torch.from_numpy(test_labels).type(torch.FloatTensor)
-
     return y_tensor_train, y_tensor_val, y_tensor_test
 
 
