@@ -1,3 +1,8 @@
 __pycache__/
 experiments/
 MambaHSI/
+kernels/*/build/
+kernels/*/develop-eggs/
+kernels/*/dist/
+kernels/*/dwconv2d.egg-info/
+kernels/*/selective_scan_rh.egg-info/
