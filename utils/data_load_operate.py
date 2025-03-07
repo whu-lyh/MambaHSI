@@ -251,7 +251,6 @@ def generate_image_iter(hsi_h, hsi_w, label_reshape, index):
         for i in range(num.shape[0]):
             label_map[idx_2d[i, 0], idx_2d[i, 1]] = label_reshape[num[i]]
         return label_map.astype(int)
-
     # for data label
     train_labels = generate_label_map(index[0], hsi_w) - 1
     val_labels = generate_label_map(index[1], hsi_w) - 1

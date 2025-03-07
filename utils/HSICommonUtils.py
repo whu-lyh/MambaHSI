@@ -14,11 +14,12 @@ def ImageStretching(image):
     """
     channels = image.shape[2]
     band_list = []
+    epsilon = 1e-6  # Small constant to prevent division by zero
     for i in range(channels):
-        band_data = image[:,:,i]
+        band_data = image[:, :, i]
         band_min = np.percentile(band_data, 2)
         band_max = np.percentile(band_data, 98)
-        band_data = (band_data - band_min) / (band_max - band_min)
+        band_data = (band_data - band_min) / (band_max - band_min + epsilon)
         # plt.imshow(band_data)
         # plt.show()
         band_list.append(band_data)

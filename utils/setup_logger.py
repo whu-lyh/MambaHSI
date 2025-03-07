@@ -141,3 +141,6 @@ def _safe_unicode(s):
         return repr(s)
 
 
+def log_args_to_file(args, pre='args', logger=None):
+    for key, val in args.__dict__.items():
+        logger.info(f'{pre}.{key} : {val}')

@@ -6,27 +6,26 @@ import time
 import numpy as np
 import torch
 from calflops import calculate_flops
-from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import models, transforms
 
 import utils.data_load_operate as data_load_operate
 from model.MambaHSI import MambaHSI
+from model.SpatialMambaHSI import SpatialMambaHSI
+from model.MambaUnetHSI import MambaUNetHSI
+from model.UNet import UNet
 from utils.evaluation import Evaluator
-from utils.HSICommonUtils import ImageStretching, normlize3D
+from utils.HSICommonUtils import ImageStretching
 from utils.Loss import head_loss, resize
-# import matplotlib.pyplot as plt
-# from visual.visualize_map import DrawResult
 from utils.setup_logger import setup_logger
-from utils.visual_predict import visualize_predict
+from utils.visual_predict import visualize_predict, visualize_results
 
 torch.autograd.set_detect_anomaly(True)
 
-time_current = time.strftime("%y-%m-%d-%H.%M", time.localtime())
-
-
-def vis_a_image(gt_vis,pred_vis,save_single_predict_path,save_single_gt_path,only_vis_label=False):
-    visualize_predict(gt_vis,pred_vis,save_single_predict_path,save_single_gt_path,only_vis_label=only_vis_label)
-    visualize_predict(gt_vis,pred_vis,save_single_predict_path.replace('.png','_mask.png'),save_single_gt_path,only_vis_label=True)
+def vis_image(gt_vis, pred_vis, save_single_predict_path, save_single_gt_path, only_vis_label=False):
+    visualize_predict(gt_vis, pred_vis, save_single_predict_path, save_single_gt_path, only_vis_label=only_vis_label)
+    visualize_predict(gt_vis, pred_vis, save_single_predict_path.replace('.png', '_mask.png'), save_single_gt_path, only_vis_label=True)
+    # visualize_results(gt_vis, pred_vis, save_single_predict_path.replace('.png', '_confusion_matrix.png'))
 
 
 # random seed setting
@@ -42,6 +41,11 @@ def setup_seed(seed):
 
 def get_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--net_name', type=str, default='MambaHSI', choices=["UNet", "MambaHSI", "SpatialMambaHSI", "MambaUNetHSI"])
+    parser.add_argument('--hidden_dim', type=int, default=128)
+    parser.add_argument('--scale_num', type=int, default=3, help="Infact the downsample layer doesn't contain bottleneck layer")
+    parser.add_argument('--use_mamba', type=bool, default=True)
+    parser.add_argument('--use_down_sample', type=bool, default=True)
     parser.add_argument('--dataset_index', type=int, default=0)
     parser.add_argument('--data_set_path', type=str, default='./data')
     parser.add_argument('--work_dir', type=str, default='./')
@@ -49,36 +53,11 @@ def get_parser():
     parser.add_argument('--max_epoch', type=int, default=200)
     parser.add_argument('--train_samples', type=int, default=30)
     parser.add_argument('--val_samples', type=int, default=10)
-    parser.add_argument('--exp_name', type=str, default='Baseline_se')
+    parser.add_argument('--val_freq', type=int, default=1, help='validate freq')
     parser.add_argument('--record_computecost', type=bool, default=False)
     args = parser.parse_args()
     return args
 
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-args = get_parser()
-
-exp_name = args.exp_name
-seed_list = [0,1,2,3,4,5,6,7,8,9]  #
-# seed_list = [0]  #
-
-num_list = [args.train_samples, args.val_samples]
-
-dataset_index = args.dataset_index
-
-net_name = 'MambaHSI'
-
-paras_dict = {'net_name':net_name, 'dataset_index':dataset_index, 'num_list':num_list,
-              'lr':args.learning_rate, 'seed_list':seed_list}
-
-                      # 0        1         2         3        4
-data_set_name_list = ['UP', 'HanChuan', 'HongHu', 'Houston']
-data_set_name = data_set_name_list[dataset_index]
-
-if data_set_name in ['HanChuan', 'Houston']:
-    split_image = True
-else:
-    split_image = False
 
 transform = transforms.Compose([
     # transforms.Resize((2048, 1024)),
@@ -87,31 +66,57 @@ transform = transforms.Compose([
     # transforms.Normalize(mean=[123.6750, 116.2800, 103.5300], std=[58.395, 57.120, 57.3750]),
 ])
 
+
 if __name__ == '__main__':
-    data_set_path = args.data_set_path
-    work_dir = args.work_dir
-    setting_name = 'tr{}val{}'.format(str(args.train_samples), str(args.val_samples)) + '_lr{}'.format(str(args.learning_rate))
-    dataset_name = data_set_name
-    exp_name = args.exp_name
-    save_folder = os.path.join(work_dir, exp_name, net_name, dataset_name)
+    args = get_parser()
+
+    seed_list = [0,1,2,3,4,5,6,7,8,9]  #
+    # seed_list = [0]  #
+
+    num_list = [args.train_samples, args.val_samples]
+
+    dataset_index = args.dataset_index
+
+    net_name = args.net_name
+
+    paras_dict = {'net_name':net_name, 'dataset_index':dataset_index, 'num_list':num_list,
+                'lr':args.learning_rate, 'seed_list':seed_list}
+
+                        # 0        1         2         3        4
+    data_set_name_list = ['UP', 'HanChuan', 'HongHu', 'Houston']
+    data_set_name = data_set_name_list[dataset_index]
+
+    if data_set_name in ['HanChuan', 'Houston'] and net_name == "MambaHSI":
+        split_image = True
+    else:
+        split_image = False 
+
+    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+    save_folder = os.path.join(args.work_dir, "experiments", net_name, data_set_name, f'{timestamp}')
+    writer = SummaryWriter(save_folder)
 
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
-        print("makedirs {}".format(save_folder))
+        # print("makedirs {}".format(save_folder))
 
     save_log_path = os.path.join(save_folder, 'train_tr{}_val{}.log'.format(num_list[0], num_list[1]))
-    logger = setup_logger(name='{}'.format(dataset_name), logfile=save_log_path)
+    logger = setup_logger(name='{}'.format(data_set_name), logfile=save_log_path)
+    logger.info(save_folder)
+    logger.info("Arguments: %s", vars(args))
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.cuda.empty_cache()
 
-    logger.info(save_folder)
     # load data
+    data_set_path = args.data_set_path
     data, gt = data_load_operate.load_data(data_set_name, data_set_path)
-    logger.info('The shape of image data: %s', data.shape)
+    logger.info('The shape of image data: %s', data.shape) # HWC
     height, width, channels = data.shape
     img = ImageStretching(data)
-    logger.info('The shape of gt: %s', gt.shape)
+    logger.info('The shape of gt: %s', gt.shape) # HW
     gt_reshape = gt.reshape(-1)
     class_count = max(np.unique(gt))
+    logger.info('The number of class: %s', class_count) # HW
     # fixed proportion for each category
     flag_list = [1, 0]  # ratio or num
     ratio_list = [0.1, 0.01]  # [train_ratio, val_ratio]
@@ -136,7 +141,7 @@ if __name__ == '__main__':
         save_vis_folder = os.path.join(save_single_experiment_folder, 'vis')
         if not os.path.exists(save_vis_folder):
             os.makedirs(save_vis_folder)
-            print("makedirs {}".format(save_vis_folder))
+            logger.info("makedirs {}".format(save_vis_folder))
 
         save_weight_path = os.path.join(save_single_experiment_folder, "best_tr{}_val{}.pth".format(num_list[0], num_list[1]))
         results_save_path = os.path.join(save_single_experiment_folder, 'result_tr{}_val{}.txt'.format(num_list[0], num_list[1]))
@@ -150,11 +155,27 @@ if __name__ == '__main__':
                                                                                                        flag_list[0])
         index = (train_data_index, val_data_index, test_data_index)
         train_label, val_label, test_label = data_load_operate.generate_image_iter(height, width, gt_reshape, index)
-        train_label = train_label.to(device)
+        train_label = train_label.to(device) # the shape is same as the gt of label but with
+        logger.info("train_label.shape: %s", train_label.shape) # torch.Tensor, HW
         test_label = test_label.to(device)
         val_label = val_label.to(device)
         # build Model
-        net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=128)
+        require_resize = True
+        if net_name == "UNet":
+            net = UNet(in_channels=channels, out_channels=class_count)
+            require_resize = False
+        elif net_name == "MambaHSI":
+            net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
+            require_resize = True
+        elif net_name == "SpatialMambaHSI":
+            use_down_sample = args.use_down_sample
+            net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim, down_sample=use_down_sample)
+            require_resize = True if use_down_sample else False
+        elif net_name == "MambaUNetHSI":
+            net = MambaUNetHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim, scale_num=args.scale_num)
+            require_resize = False
+        else:
+            raise NotImplementedError(f'Sorry, <{net_name}> model is not implemented!')
         net.to(device)
         logger.info(paras_dict)
         # logger.info(net)
@@ -172,7 +193,7 @@ if __name__ == '__main__':
 
         optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
 
-        logger.info(optimizer)
+        # logger.info(optimizer)
         best_loss = 99999
         if args.record_computecost:
             net.eval()
@@ -196,94 +217,87 @@ if __name__ == '__main__':
                 y_part1 = y_train[:, :x.shape[2] // 2 + 5, :]
                 x_part2 = x[:, :, x.shape[2] // 2 - 5: , :]
                 y_part2 = y_train[:, x.shape[2] // 2 - 5:, :]
+                logger.info('The shape of part1 of x: {}'.format(x_part1.shape))
+                logger.info('The shape of part2 of x: {}'.format(x_part2.shape))
                 
                 y_pred_part1 = net(x_part1)
-                ls1 = head_loss(loss_func, y_pred_part1, y_part1.long())
+                ls1 = head_loss(loss_func, y_pred_part1, y_part1.long(), require_resize=require_resize)
                 optimizer.zero_grad()
                 ls1.backward()
                 optimizer.step()
                 torch.cuda.empty_cache()
 
                 y_pred_part2 = net(x_part2)
-                ls2 = head_loss(loss_func, y_pred_part2, y_part2.long())
+                ls2 = head_loss(loss_func, y_pred_part2, y_part2.long(), require_resize=require_resize)
                 optimizer.zero_grad()
                 ls2.backward()
                 optimizer.step()
                 torch.cuda.empty_cache()
 
                 logger.info('Iter:{}|loss:{}'.format(epoch, (ls1 + ls2).detach().cpu().numpy()))
+                writer.add_scalar(f"Loss/{args.net_name}", (ls1 + ls2).detach().cpu().numpy(), epoch)
             else:
-                try:
-                    y_pred = net(x)
-                    ls = head_loss(loss_func, y_pred, y_train.long())
-                    optimizer.zero_grad()
-                    ls.backward()
-                    optimizer.step()
-                    logger.info('Iter:{}|loss:{}'.format(epoch, ls.detach().cpu().numpy()))
-                except:
-                    optimizer.zero_grad()
-                    torch.cuda.empty_cache()
-                    split_image = True
+                y_pred = net(x)
+                ls = head_loss(loss_func, y_pred, y_train.long(), require_resize=require_resize)
+                optimizer.zero_grad()
+                ls.backward()
+                optimizer.step()
+                logger.info('Iter:{}|loss:{}'.format(epoch, ls.detach().cpu().numpy()))
 
-                    x_part1 = x[:, :, :x.shape[2] // 2 + 5, :]
-                    y_part1 = y_train[:, :x.shape[2] // 2 + 5, :]
-                    x_part2 = x[:, :, x.shape[2] // 2 - 5:, :]
-                    y_part2 = y_train[:, x.shape[2] // 2 - 5:, :]
-
-                    y_pred_part1 = net(x_part1)
-                    ls1 = head_loss(loss_func, y_pred_part1, y_part1.long())
-                    optimizer.zero_grad()
-                    ls1.backward()
-                    optimizer.step()
-
-                    y_pred_part2 = net(x_part2)
-                    ls2 = head_loss(loss_func, y_pred_part2, y_part2.long())
-                    optimizer.zero_grad()
-                    ls2.backward()
-                    optimizer.step()
-
-                    logger.info('Iter:{}|loss:{}'.format(epoch, (ls1 + ls2).detach().cpu().numpy()))
-
-            torch.cuda.empty_cache()
-            # evaluate stage
-            net.eval()
-            with torch.no_grad():
-                evaluator.reset()
-                output_val = net(x)
-                y_val = val_label.unsqueeze(0)
-                seg_logits = resize(input=output_val, size=y_val.shape[1:], mode='bilinear', align_corners=True)
-                predict = torch.argmax(seg_logits, dim=1).cpu().numpy()
-                Y_val_np = val_label.cpu().numpy()
-                Y_val_255 = np.where(Y_val_np==-1, 255, Y_val_np)
-                evaluator.add_batch(np.expand_dims(Y_val_255, axis=0), predict)
-                OA = evaluator.Pixel_Accuracy()
-                mIOU, IOU = evaluator.Mean_Intersection_over_Union()
-                mAcc, Acc = evaluator.Pixel_Accuracy_Class()
-                Kappa = evaluator.Kappa()
-                logger.info('Evaluate {}|OA:{}|MACC:{}|Kappa:{}|MIOU:{}\n|IOU:{}\n|ACC:{}'.format(epoch, OA, mAcc, Kappa, mIOU,
-                                                                                                  IOU, Acc))
-                # save weight
-                if OA >= best_val_acc:
-                    best_epoch = epoch + 1
-                    best_val_acc = OA
-                    # torch.save(net,save_weight_path)
-                    torch.save(net.state_dict(), save_weight_path)
-                    # save_epoch_weight_path = os.path.join(save_folder,'{}.pth'.format(str(epoch+1)))
-                    # torch.save(net.state_dict(), save_epoch_weight_path)
-                if (epoch+1) % 50 == 0:
-                    save_single_predict_path = os.path.join(save_vis_folder, 'predict_{}.png'.format(str(epoch+1)))
-                    save_single_gt_path = os.path.join(save_vis_folder, 'gt.png')
-                    vis_a_image(gt, predict, save_single_predict_path, save_single_gt_path)
+            if (epoch % int(args.val_freq)) == 0 and epoch != 0:
+                torch.cuda.empty_cache()
+                # evaluate stage
+                net.eval()
+                with torch.no_grad():
+                    evaluator.reset()
+                    output_val = net(x) # shape: B class_count 
+                    y_val = val_label.unsqueeze(0) # shape: BHW
+                    # resize the spatial resolution of output from net to be same as the shape of y_val
+                    # the channel number will not be influnced
+                    if require_resize:
+                        seg_logits = resize(input=output_val, size=y_val.shape[1:], mode='bilinear', align_corners=True)
+                    else:
+                        seg_logits = output_val
+                    predict = torch.argmax(seg_logits, dim=1).cpu().numpy() # get the largest one channel shape: BHW
+                    Y_val_np = val_label.cpu().numpy()
+                    Y_val_255 = np.where(Y_val_np==-1, 255, Y_val_np)
+                    evaluator.add_batch(np.expand_dims(Y_val_255, axis=0), predict)
+                    OA = evaluator.Pixel_Accuracy()
+                    mIOU, IOU = evaluator.Mean_Intersection_over_Union()
+                    mAcc, Acc = evaluator.Pixel_Accuracy_Class()
+                    Kappa = evaluator.Kappa()
+                    logger.info('Evaluate {}|OA:{}|MACC:{}|Kappa:{}|MIOU:{}\n|IOU:{}\n|ACC:{}'.format(epoch, OA, mAcc, Kappa, mIOU, IOU, Acc))
+                    # save weight
+                    if OA >= best_val_acc:
+                        best_epoch = epoch + 1
+                        best_val_acc = OA
+                        # torch.save(net,save_weight_path)
+                        torch.save(net.state_dict(), save_weight_path)
+                        # save_epoch_weight_path = os.path.join(save_folder,'{}.pth'.format(str(epoch+1)))
+                        # torch.save(net.state_dict(), save_epoch_weight_path)
+                    # if (epoch + 1) % 1 == 0:
+                    #     save_single_predict_path = os.path.join(save_vis_folder, 'predict_{}.png'.format(str(epoch + 1)))
+                    #     save_single_gt_path = os.path.join(save_vis_folder, 'gt.png')
+                    #     vis_image(gt, predict, save_single_predict_path, save_single_gt_path)
 
             torch.cuda.empty_cache()
         logger.info("\n\n====================Training finished.========================\n")
         logger.info("\n\n====================Starting evaluation for testing set.========================\n")
-        pred_test = []
 
         load_weight_path = save_weight_path
         net.update_params = None
         # best_net = copy.deepcopy(net)
-        best_net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=128)
+        if net_name == "UNet":
+            best_net = UNet(in_channels=channels, out_channels=class_count)
+        elif net_name == "MambaHSI":
+            best_net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
+        elif net_name == "SpatialMambaHSI":
+            best_net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
+        elif net_name == "MambaUNetHSI":
+            best_net = MambaUNetHSI(in_channels=channels, num_classes=class_count, 
+                                 hidden_dim=args.hidden_dim, scale_num=args.scale_num)
+        else:
+            raise NotImplementedError(f'Sorry, <{net_name}> model is not implemented!')
         best_net.to(device)
         best_net.load_state_dict(torch.load(load_weight_path))
         best_net.eval()
@@ -292,7 +306,10 @@ if __name__ == '__main__':
             test_evaluator.reset()
             output_test = best_net(x)
             y_test = test_label.unsqueeze(0)
-            seg_logits_test = resize(input=output_test, size=y_test.shape[1:], mode='bilinear', align_corners=True)
+            if require_resize:
+                seg_logits_test = resize(input=output_test, size=y_test.shape[1:], mode='bilinear', align_corners=True)
+            else:
+                seg_logits_test = output_test
             predict_test = torch.argmax(seg_logits_test, dim=1).cpu().numpy()
             Y_test_np = test_label.cpu().numpy()
             Y_test_255 = np.where(Y_test_np == -1, 255, Y_test_np)
@@ -304,8 +321,8 @@ if __name__ == '__main__':
             Kappa_test = test_evaluator.Kappa()
             logger.info('Test {}|OA:{}|MACC:{}|Kappa:{}|MIOU:{}\n|IOU:{}\n|ACC:{}'.format(epoch, OA_test, mAcc_test, Kappa_test, mIOU_test, 
                                                                                           IOU_test, Acc_test))
-            vis_a_image(gt, predict_test, predict_save_path, gt_save_path)
-        # Output infors
+            vis_image(gt, predict_test, predict_save_path, gt_save_path)
+        # Output infos
         f = open(results_save_path, 'a+')
         str_results = '\n======================' \
                       + " exp_idx=" + str(exp_idx) \

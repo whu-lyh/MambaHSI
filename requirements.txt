@@ -4,3 +4,7 @@ mamba-ssm==1.2.0
 spectral
 scikit-learn==1.4.1.post1
 calflops
+timm==0.4.12
+Cython
+tensorboard
+seaborn
