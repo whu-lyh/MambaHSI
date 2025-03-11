@@ -117,7 +117,7 @@ class MambaHSI(nn.Module):
                  use_residual=True, mamba_type='spe', token_num=4, group_num=4, use_att=True):
         super(MambaHSI, self).__init__()
         self.mamba_type = mamba_type
-
+        # just a normal conv+gn+silu xnn stem
         self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=in_channels, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
                                              nn.GroupNorm(group_num, hidden_dim),
                                              nn.SiLU())

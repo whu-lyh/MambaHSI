@@ -10,9 +10,8 @@
 # -----------------------------------------------------------------------------------
 
 import math
-import copy
 from functools import partial
-from typing import Optional, Callable
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -21,6 +20,8 @@ import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.layers import to_2tuple
+
+from .attention_utils import SEAttention
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 
@@ -203,7 +204,6 @@ class Stem(nn.Module):
         )
 
     def forward(self, x):
-
         x = self.conv1(x)
         x = self.conv2(x) + x
         x = self.conv3(x)
@@ -259,10 +259,36 @@ class MLP(nn.Module):
         return x
 
 
+class StateFusionSS(nn.Module):
+    def __init__(self, in_channels, kernel_size: int = 3, stride: int = 1, pad: int = 2):
+        super(StateFusionSS, self).__init__()
+        self.ss_conv = nn.Conv3d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=(kernel_size, kernel_size, kernel_size),
+            stride=(stride, stride, stride),
+            padding=(pad, pad, pad),
+            # groups=in_channels, # poor performance.
+            dilation=(pad, pad, pad)
+        )
+        self.pointwise_conv3d = nn.Conv3d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0
+        )
+
+    def forward(self, x):
+        x1 = x.unsqueeze(2)
+        x1 = self.ss_conv(x1)
+        x1 = x1.squeeze(2)
+        return x1
+        
+
 class StateFusion(nn.Module):
     def __init__(self, dim):
         super(StateFusion, self).__init__()
-
         self.dim = dim
         self.kernel_3   = nn.Parameter(torch.ones(dim, 1, 3, 3))
         self.kernel_3_1 = nn.Parameter(torch.ones(dim, 1, 3, 3))
@@ -274,14 +300,12 @@ class StateFusion(nn.Module):
         return torch.nn.functional.pad(input_tensor, padding, mode='replicate')
 
     def forward(self, h):
-
         if self.training:
             h1 = F.conv2d(self.padding(h, (1,1,1,1)), self.kernel_3,   padding=0, dilation=1, groups=self.dim)
             h2 = F.conv2d(self.padding(h, (3,3,3,3)), self.kernel_3_1, padding=0, dilation=3, groups=self.dim)
             h3 = F.conv2d(self.padding(h, (5,5,5,5)), self.kernel_3_2, padding=0, dilation=5, groups=self.dim)
             out = self.alpha[0]*h1 + self.alpha[1]*h2 + self.alpha[2]*h3
             return out
-
         else:
             if not hasattr(self, "_merge_weight"):
                 self._merge_weight = torch.zeros((self.dim, 1, 11, 11), device=h.device)
@@ -308,7 +332,6 @@ class StateFusion(nn.Module):
                 self._merge_weight[:, :, 10:11, 10:11] = self.alpha[2]*self.kernel_3_2[:,:,2:3,2:3]
 
             out = DepthwiseFunction.apply(h, self._merge_weight, None, 11//2, 11//2, False)
-
             return out
 
 
@@ -340,9 +363,9 @@ class StructureAwareSSM(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        # project the input dim in 4 times dim space
+        # project the input dim in 4 times of d_model
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        # extract the local patch context and keep the spatial resolution unchanged
+        # extract the local patch context (depth-wise Conv) and keep the spatial resolution unchanged
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -367,8 +390,9 @@ class StructureAwareSSM(nn.Module):
         self.Ds = self.D_init(self.d_inner, dt_init)
 
         self.selective_scan = selective_scan_fn
-
+        # the main contribution of SpatialMamba
         self.state_fusion = StateFusion(self.d_inner)
+        # self.state_fusion = StateFusionSS(self.d_inner)
 
         self.out_norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
@@ -516,12 +540,12 @@ class SpatialMambaBlock(nn.Module):
         **kwargs,
     ):
         super().__init__()
-
+        # depth-wise convolution
         self.cpe1 = nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim)
         self.ln_1 = norm_layer(hidden_dim)
         self.self_attention = StructureAwareSSM(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, dt_init=dt_init, **kwargs)
         self.drop_path = DropPath(drop_path)
-
+        # depth-wise convolution
         self.cpe2 = nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim)
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLP(in_features=hidden_dim, hidden_features=int(hidden_dim*mlp_ratio), act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=False)
@@ -702,25 +726,114 @@ class SpatialMamba(nn.Module):
         return x
 
 
+class Attention(nn.Module):
+    def __init__(
+            self,
+            dim,
+            num_heads=8,
+            qkv_bias=False,
+            qk_norm=False,
+            attn_drop=0.,
+            proj_drop=0.,
+            norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = True
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(
+             q, k, v,
+                dropout_p=self.attn_drop.p,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class ChannelGateWithAttention(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ChannelGateWithAttention, self).__init__()
+
+        # Step 1: Depthwise Convolution (each channel processed independently)
+        self.depthwise_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+
+        # Step 2: Learnable Scaling Factor for Gate Mechanism (soft attention)
+        self.channel_gate = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        self.sigmoid = nn.Sigmoid()  # Sigmoid activation to generate gating coefficients between 0 and 1
+        self.scale_factor = nn.Parameter(torch.ones(1))  # Learnable scaling factor to adjust the gate's impact
+
+        # Step 3: Pointwise Convolution (reduce channel dimensions after gating)
+        self.pointwise_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # Apply depthwise convolution to extract features for each channel independently
+        x = self.depthwise_conv(x)
+
+        # Apply channel gating mechanism to learn channel-wise attention
+        gate = self.channel_gate(x)  # Generate gating coefficients for each channel
+        gate = self.sigmoid(gate)  # Apply sigmoid to ensure values are between 0 and 1
+        x = x * gate  # Element-wise multiplication (apply gate to the features)
+
+        # Apply a learnable scaling factor to control the impact of the gate
+        x = x * self.scale_factor  # Scale the gated features
+
+        # Apply pointwise convolution to reduce the channel dimension
+        x = self.pointwise_conv(x)
+        return x
+
+
 class SpatialMambaHSI(nn.Module):
-    def __init__(self, in_channels=128, hidden_dim=64, num_classes=10, group_num=4, down_sample: bool = True):
+    def __init__(self, in_channels: int = 128, 
+                 hidden_dim: int = 64, 
+                 depth: int = 2,
+                 num_classes: int = 10, 
+                 group_num: int = 4, 
+                 down_sample: bool = True):
         super(SpatialMambaHSI, self).__init__()
 
-        self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=in_channels, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
+        # channel gate
+        self.gate = ChannelGateWithAttention(in_channels=in_channels, out_channels=64)
+        # normal cnn stem
+        self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=64, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
                                              nn.GroupNorm(group_num, hidden_dim),
                                              nn.SiLU())
 
-        self.depth = 1
-        dim = []
-        for i in range(self.depth):
-            dim.append(hidden_dim * (i+1))
+        self.depth = depth
+        # dim = []
+        # for i in range(self.depth):
+        #     dim.append(hidden_dim * (i+1))
         self.mamba_blocks = nn.ModuleList([
                 SpatialMambaBlock(
                     hidden_dim=hidden_dim,
                     drop_path=0.0,
                     norm_layer=nn.LayerNorm,
                     attn_drop_rate=0.0,
-                    d_state=1,
+                    d_state=1, # 1 is mandatory here
                     dt_init="random",
                     mlp_ratio=4.0,
             )
@@ -731,9 +844,8 @@ class SpatialMambaHSI(nn.Module):
         # downsample is necessary
         self.down_sample = down_sample
         if self.down_sample:
-            self.downsample = nn.Sequential(ConvLayer(hidden_dim, hidden_dim * self.ratio, 
-                                                    kernel_size=3, stride=2, padding=1, 
-                                                    groups=hidden_dim, norm=None))
+            self.downsample = nn.Sequential(ConvLayer(hidden_dim, hidden_dim * self.ratio, kernel_size=3, stride=2, padding=1, groups=hidden_dim, norm=None))
+        self.channel_attn = SEAttention(hidden_dim * self.ratio)
         self.cls_head = nn.Sequential(nn.Conv2d(in_channels=hidden_dim * self.ratio, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
                                       nn.GroupNorm(group_num, hidden_dim),
                                       nn.SiLU(),
@@ -751,16 +863,19 @@ class SpatialMambaHSI(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
+        x = self.gate(x)
         patch_embeddings = self.patch_embedding(x) # shape: BCHW -> B hidden_dim HW
         x1 = rearrange(patch_embeddings, "b c h w -> b h w c")
         x1 = self.pos_drop(x1)
-        for mamba in self.mamba_blocks:
+        for i, mamba in enumerate(self.mamba_blocks):
             x1 = mamba(x1)
             x1 = rearrange(x1, 'b h w c -> b c h w').contiguous()
-            if self.down_sample:
+            # att downsample layer at the last block
+            if self.down_sample and (i == self.depth - 1):
                 x1 = self.downsample(x1)
             x1 = rearrange(x1, 'b c h w -> b h w c')
         x1 = rearrange(x1, "b h w c -> b c h w")
+        x1 = self.channel_attn(x1)
         logits = self.cls_head(x1)
         return logits
 
