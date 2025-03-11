@@ -7,12 +7,13 @@ import numpy as np
 import torch
 from calflops import calculate_flops
 from torch.utils.tensorboard import SummaryWriter
-from torchvision import models, transforms
+from torchvision import transforms
+from tqdm import tqdm, trange
 
 import utils.data_load_operate as data_load_operate
 from model.MambaHSI import MambaHSI
-from model.SpatialMambaHSI import SpatialMambaHSI
 from model.MambaUnetHSI import MambaUNetHSI
+from model.SpatialMambaHSI import SpatialMambaHSI
 from model.UNet import UNet
 from utils.evaluation import Evaluator
 from utils.HSICommonUtils import ImageStretching
@@ -41,11 +42,12 @@ def setup_seed(seed):
 
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--net_name', type=str, default='MambaHSI', choices=["UNet", "MambaHSI", "SpatialMambaHSI", "MambaUNetHSI"])
+    parser.add_argument('--net_name', type=str, default='MambaHSI', choices=["UNet", "MambaHSI", "SpatialMambaHSI", "MambaUNetHSI", "MambaVision"])
     parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--scale_num', type=int, default=3, help="Infact the downsample layer doesn't contain bottleneck layer")
-    parser.add_argument('--use_mamba', type=bool, default=True)
-    parser.add_argument('--use_down_sample', type=bool, default=True)
+    parser.add_argument('--depth', type=int, default=1, help="The number of mamba blocks")
+    parser.add_argument('--use_mamba', default=True, action='store_true')
+    parser.add_argument('--use_down_sample', default=False, action="store_true")
     parser.add_argument('--dataset_index', type=int, default=0)
     parser.add_argument('--data_set_path', type=str, default='./data')
     parser.add_argument('--work_dir', type=str, default='./')
@@ -71,7 +73,7 @@ if __name__ == '__main__':
     args = get_parser()
 
     seed_list = [0,1,2,3,4,5,6,7,8,9]  #
-    # seed_list = [0]  #
+    # seed_list = [0, 1]  #
 
     num_list = [args.train_samples, args.val_samples]
 
@@ -86,7 +88,7 @@ if __name__ == '__main__':
     data_set_name_list = ['UP', 'HanChuan', 'HongHu', 'Houston']
     data_set_name = data_set_name_list[dataset_index]
 
-    if data_set_name in ['HanChuan', 'Houston'] and net_name == "MambaHSI":
+    if data_set_name in ['HanChuan', 'Houston'] and net_name == ("MambaHSI" or "SpatialMambaHSI"):
         split_image = True
     else:
         split_image = False 
@@ -169,7 +171,8 @@ if __name__ == '__main__':
             require_resize = True
         elif net_name == "SpatialMambaHSI":
             use_down_sample = args.use_down_sample
-            net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim, down_sample=use_down_sample)
+            net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, depth=args.depth,
+                                  hidden_dim=args.hidden_dim, down_sample=use_down_sample)
             require_resize = True if use_down_sample else False
         elif net_name == "MambaUNetHSI":
             net = MambaUNetHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim, scale_num=args.scale_num)
@@ -203,7 +206,8 @@ if __name__ == '__main__':
         tic1 = time.perf_counter()
         best_val_acc = 0
         # train loop
-        for epoch in range(args.max_epoch):
+        tqdm_object = tqdm(range(args.max_epoch), total=args.max_epoch, leave=False, desc='Train Iter'.rjust(10), colour="blue")
+        for epoch, batch in enumerate(tqdm_object):
             y_train = train_label.unsqueeze(0)
             train_acc_sum, trained_samples_counter = 0.0, 0
             batch_counter, train_loss_sum = 0, 0
@@ -234,15 +238,19 @@ if __name__ == '__main__':
                 optimizer.step()
                 torch.cuda.empty_cache()
 
-                logger.info('Iter:{}|loss:{}'.format(epoch, (ls1 + ls2).detach().cpu().numpy()))
+                # logger.info('Iter:{}|loss:{}'.format(epoch, (ls1 + ls2).detach().cpu().numpy()))
                 writer.add_scalar(f"Loss/{args.net_name}", (ls1 + ls2).detach().cpu().numpy(), epoch)
+                tqdm_object.set_postfix(train_loss=(ls1 + ls2).detach().cpu().numpy())
             else:
                 y_pred = net(x)
                 ls = head_loss(loss_func, y_pred, y_train.long(), require_resize=require_resize)
                 optimizer.zero_grad()
                 ls.backward()
                 optimizer.step()
-                logger.info('Iter:{}|loss:{}'.format(epoch, ls.detach().cpu().numpy()))
+                # logger.info('Iter:{}|loss:{}'.format(epoch, ls.detach().cpu().numpy()))
+                writer.add_scalar(f"Loss/{args.net_name}", ls.detach().cpu().numpy(), epoch)
+                tqdm_object.set_postfix(train_loss=ls.detach().cpu().numpy())
+                torch.cuda.empty_cache()
 
             if (epoch % int(args.val_freq)) == 0 and epoch != 0:
                 torch.cuda.empty_cache()
@@ -281,24 +289,24 @@ if __name__ == '__main__':
                     #     vis_image(gt, predict, save_single_predict_path, save_single_gt_path)
 
             torch.cuda.empty_cache()
+        del net
         logger.info("\n\n====================Training finished.========================\n")
         logger.info("\n\n====================Starting evaluation for testing set.========================\n")
-
-        load_weight_path = save_weight_path
-        net.update_params = None
-        # best_net = copy.deepcopy(net)
+        # reload the best model
         if net_name == "UNet":
             best_net = UNet(in_channels=channels, out_channels=class_count)
         elif net_name == "MambaHSI":
             best_net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
         elif net_name == "SpatialMambaHSI":
-            best_net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
+            best_net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, depth=args.depth,
+                                  hidden_dim=args.hidden_dim, down_sample=use_down_sample)
         elif net_name == "MambaUNetHSI":
             best_net = MambaUNetHSI(in_channels=channels, num_classes=class_count, 
                                  hidden_dim=args.hidden_dim, scale_num=args.scale_num)
         else:
             raise NotImplementedError(f'Sorry, <{net_name}> model is not implemented!')
         best_net.to(device)
+        load_weight_path = save_weight_path
         best_net.load_state_dict(torch.load(load_weight_path))
         best_net.eval()
         test_evaluator = Evaluator(num_class=class_count)

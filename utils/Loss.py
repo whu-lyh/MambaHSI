@@ -1,4 +1,5 @@
 
+from utils.lovasz_loss import lovasz_softmax
 from utils.wrappers import resize
 
 
@@ -11,7 +12,9 @@ def head_loss(loss_func, logits, label, align_corners=True, require_resize=True)
             align_corners=align_corners)
     else:
         seg_logits = logits
-    # print("seg_logits: ", seg_logits.shape)
-    # print("label: ", label.shape)
+
     loss = loss_func(seg_logits, label)
+    if False: # useless till now 20250310
+        lloss = lovasz_softmax(seg_logits, label, ignore=255)
+        loss = loss + 0.75 * lloss
     return loss
