@@ -114,7 +114,7 @@ class BothMamba(nn.Module):
 
 class MambaHSI(nn.Module):
     def __init__(self, in_channels=128, hidden_dim=64, num_classes=10, 
-                 use_residual=True, mamba_type='spe', token_num=4, group_num=4, use_att=True):
+                 use_residual=True, mamba_type='both', token_num=4, group_num=4, use_att=True):
         super(MambaHSI, self).__init__()
         self.mamba_type = mamba_type
         # just a normal conv+gn+silu xnn stem

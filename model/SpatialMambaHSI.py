@@ -9,6 +9,7 @@
 # Modified by Chaodong Xiao
 # -----------------------------------------------------------------------------------
 
+import copy
 import math
 from functools import partial
 from typing import Callable
@@ -18,10 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
-from timm.models.layers import DropPath, trunc_normal_
-from timm.models.layers import to_2tuple
+from fvcore.nn import flop_count, parameter_count
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 from .attention_utils import SEAttention
+from .moe import MixtureOfExperts
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 
@@ -30,6 +32,7 @@ try:
 except:
     DepthwiseFunction = None
 import selective_scan_cuda_oflex_rh
+
 
 def flops_selective_scan_fn(B=1, L=256, D=768, N=16, with_C = True, with_D=True, with_Z=False, with_complex=False,):
     """
@@ -231,9 +234,6 @@ class DownSampling(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x: B, H, W, C
-        """
         x = self.conv(rearrange(x, 'b h w d -> b d h w').contiguous())
         x = rearrange(x, 'b d h w -> b h w d')
         return x
@@ -284,9 +284,13 @@ class StateFusionSS(nn.Module):
         x1 = self.ss_conv(x1)
         x1 = x1.squeeze(2)
         return x1
-        
+
 
 class StateFusion(nn.Module):
+    """multi-scale local context extraction module based on depth-wise convolution.
+    re-parameterization techniques are used to accelerate inference speed.
+
+    """
     def __init__(self, dim):
         super(StateFusion, self).__init__()
         self.dim = dim
@@ -333,6 +337,66 @@ class StateFusion(nn.Module):
 
             out = DepthwiseFunction.apply(h, self._merge_weight, None, 11//2, 11//2, False)
             return out
+
+
+# Channel Attention (SE Block)
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+# Spatial Attention
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        y = torch.cat([avg_out, max_out], dim=1)
+        y = self.conv(y)
+        y = self.sigmoid(y)
+        return x * y
+
+
+# Adaptive Fusion Spectral-Spatial Attention Module
+class StateFusionASSF(nn.Module):
+    def __init__(self, channels, reduction=16, spatial_kernel=3):
+        super(StateFusionASSF, self).__init__()
+        self.channel_attention = SEBlock(channels, reduction)
+        self.spatial_attention = SpatialAttention(spatial_kernel)
+
+        # Adaptive fusion parameter: a learnable scalar
+        self.alpha_param = nn.Parameter(torch.tensor(0.5))  # Initial value = 0.5
+
+    def forward(self, x):
+        ca = self.channel_attention(x)  # Channel attention
+        sa = self.spatial_attention(x)  # Spatial attention
+
+        # Sigmoid to restrict it to [0, 1]
+        alpha = torch.sigmoid(self.alpha_param)
+
+        # Adaptive fusion
+        out = alpha * ca + (1 - alpha) * sa
+        return out
+
+
+
 
 
 class StructureAwareSSM(nn.Module):
@@ -392,6 +456,8 @@ class StructureAwareSSM(nn.Module):
         self.selective_scan = selective_scan_fn
         # the main contribution of SpatialMamba
         self.state_fusion = StateFusion(self.d_inner)
+        # self.state_fusion = StateFusionASSF(self.d_inner)
+        # self.state_fusion = MixtureOfExperts(dim=self.d_inner, num_experts=4)
         # self.state_fusion = StateFusionSS(self.d_inner)
 
         self.out_norm = nn.LayerNorm(self.d_inner)
@@ -570,7 +636,6 @@ class SpatialMambaLayer(nn.Module):
         downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
-
     def __init__(
         self, 
         dim, 
@@ -705,6 +770,27 @@ class SpatialMamba(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
+    def flops(self, shape=(3, 224, 224), verbose=True):
+        # shape = self.__input_shape__[1:]
+        supported_ops={
+            "aten::silu": None, # as relu is in _IGNORED_OPS
+            "aten::neg": None, # as relu is in _IGNORED_OPS
+            "aten::exp": None, # as relu is in _IGNORED_OPS
+            "aten::flip": None, # as permute is in _IGNORED_OPS
+            "prim::PythonOp.SelectiveScanStateFn": selective_scan_state_flop_jit,
+        }
+
+        model = copy.deepcopy(self)
+        model.cuda()#.eval()
+
+        input = torch.randn((1, *shape), device=next(model.parameters()).device)
+        params = parameter_count(model)[""]
+        Gflops, unsupported = flop_count(model=model, inputs=(input,), supported_ops=supported_ops)
+
+        del model, input
+        return sum(Gflops.values()) * 1e9
+        return f"params {params} GFLOPs {sum(Gflops.values())}"
+
     def forward_features(self, x):
         x = self.patch_embed(x) # BCHW -> BHW self.embed_dim
         if self.ape:
@@ -816,24 +902,22 @@ class SpatialMambaHSI(nn.Module):
                  down_sample: bool = True):
         super(SpatialMambaHSI, self).__init__()
 
-        # channel gate
-        self.gate = ChannelGateWithAttention(in_channels=in_channels, out_channels=64)
+        # channel gate, aiming to reduce the input channel dimension, but the performance gets poor
+        # self.gate = ChannelGateWithAttention(in_channels=in_channels, out_channels=64)
         # normal cnn stem
-        self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=64, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
+        self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=in_channels, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
                                              nn.GroupNorm(group_num, hidden_dim),
                                              nn.SiLU())
 
         self.depth = depth
-        # dim = []
-        # for i in range(self.depth):
-        #     dim.append(hidden_dim * (i+1))
+        # mamba blocks
         self.mamba_blocks = nn.ModuleList([
                 SpatialMambaBlock(
                     hidden_dim=hidden_dim,
                     drop_path=0.0,
                     norm_layer=nn.LayerNorm,
                     attn_drop_rate=0.0,
-                    d_state=1, # 1 is mandatory here
+                    d_state=1, # 1 is mandatory here, issue at https://github.com/EdwardChasel/Spatial-Mamba/issues/7#issuecomment-2493858325
                     dt_init="random",
                     mlp_ratio=4.0,
             )
@@ -845,7 +929,8 @@ class SpatialMambaHSI(nn.Module):
         self.down_sample = down_sample
         if self.down_sample:
             self.downsample = nn.Sequential(ConvLayer(hidden_dim, hidden_dim * self.ratio, kernel_size=3, stride=2, padding=1, groups=hidden_dim, norm=None))
-        self.channel_attn = SEAttention(hidden_dim * self.ratio)
+        # aiming to boost the performance, but the performance gets poor
+        # self.channel_attn = SEAttention(hidden_dim * self.ratio)
         self.cls_head = nn.Sequential(nn.Conv2d(in_channels=hidden_dim * self.ratio, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
                                       nn.GroupNorm(group_num, hidden_dim),
                                       nn.SiLU(),
@@ -862,8 +947,13 @@ class SpatialMambaHSI(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+        for name, p in m.named_parameters():
+            if name in ["out_proj.weight"]:
+                p = p.clone().detach_()
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+
     def forward(self, x):
-        x = self.gate(x)
+        # x = self.gate(x)
         patch_embeddings = self.patch_embedding(x) # shape: BCHW -> B hidden_dim HW
         x1 = rearrange(patch_embeddings, "b c h w -> b h w c")
         x1 = self.pos_drop(x1)
@@ -875,7 +965,7 @@ class SpatialMambaHSI(nn.Module):
                 x1 = self.downsample(x1)
             x1 = rearrange(x1, 'b c h w -> b h w c')
         x1 = rearrange(x1, "b h w c -> b c h w")
-        x1 = self.channel_attn(x1)
+        # x1 = self.channel_attn(x1)
         logits = self.cls_head(x1)
         return logits
 
