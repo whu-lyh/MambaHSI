@@ -22,6 +22,9 @@ def load_data(data_set_name, data_path='./data'):
     if data_set_name == 'UP':
         data = sio.loadmat(os.path.join(data_path, 'UP', 'PaviaU.mat'))['paviaU']
         labels = sio.loadmat(os.path.join(data_path, 'UP', 'PaviaU_gt.mat'))['paviaU_gt']
+    elif data_set_name == 'IndianPines':
+        data = sio.loadmat(os.path.join(data_path, 'IndianPines', 'Indian_pines_corrected.mat'))['indian_pines_corrected']
+        labels = sio.loadmat(os.path.join(data_path, 'IndianPines', 'Indian_pines_gt.mat'))['indian_pines_gt']
     elif data_set_name == 'Houston':
         data = sio.loadmat(os.path.join(data_path, 'Houston', 'Houston.mat'))['Houston']
         labels = sio.loadmat(os.path.join(data_path, 'Houston', 'Houston_GT.mat'))['Houston_GT']
@@ -56,7 +59,7 @@ def sampling(ratio_list, num_list, gt_reshape, class_count, Flag):
         # get labels from each category
         cls_index = np.where(gt_reshape == cls + 1)[0]
         all_label_index_dict[cls] = list(cls_index)
-
+        # shuffle the index each sampling process
         np.random.shuffle(cls_index)
 
         if Flag == 0:  # Fixed proportion for each category
