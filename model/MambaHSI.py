@@ -117,7 +117,7 @@ class MambaHSI(nn.Module):
                  use_residual=True, mamba_type='both', token_num=4, group_num=4, use_att=True):
         super(MambaHSI, self).__init__()
         self.mamba_type = mamba_type
-        # just a normal conv+gn+silu xnn stem
+        # just a normal conv+gn+silu cnn stem
         self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=in_channels, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
                                              nn.GroupNorm(group_num, hidden_dim),
                                              nn.SiLU())
@@ -141,7 +141,7 @@ class MambaHSI(nn.Module):
                                        nn.AvgPool2d(kernel_size=2, stride=2, padding=0),
                                        BothMamba(channels=hidden_dim, token_num=token_num, use_residual=use_residual, group_num=group_num, use_att=use_att),
                                        nn.AvgPool2d(kernel_size=2, stride=2, padding=0),
-                                       BothMamba(channels=hidden_dim, token_num=token_num, use_residual=use_residual, group_num=group_num,use_att=use_att),
+                                       BothMamba(channels=hidden_dim, token_num=token_num, use_residual=use_residual, group_num=group_num, use_att=use_att),
                                        )
 
         self.cls_head = nn.Sequential(nn.Conv2d(in_channels=hidden_dim, out_channels=128, kernel_size=1, stride=1, padding=0),

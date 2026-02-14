@@ -11,6 +11,7 @@ from torchvision import transforms
 from tqdm import tqdm, trange
 
 import utils.data_load_operate as data_load_operate
+from model.mamba_vision import MambaVisionHSI
 from model.MambaHSI import MambaHSI
 from model.MambaUnetHSI import MambaUNetHSI
 from model.SpatialMambaHSI import SpatialMambaHSI
@@ -42,11 +43,10 @@ def setup_seed(seed):
 
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--net_name', type=str, default='MambaHSI', choices=["UNet", "MambaHSI", "SpatialMambaHSI", "MambaUNetHSI", "MambaVision"])
+    parser.add_argument('--net_name', type=str, default='MambaHSI', choices=["UNet", "MambaHSI", "SpatialMambaHSI", "MambaUNetHSI", "MambaVisionHSI"])
     parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--scale_num', type=int, default=3, help="Infact the downsample layer doesn't contain bottleneck layer")
     parser.add_argument('--depth', type=int, default=1, help="The number of mamba blocks")
-    parser.add_argument('--use_mamba', default=True, action='store_true')
     parser.add_argument('--use_down_sample', default=False, action="store_true")
     parser.add_argument('--dataset_index', type=int, default=0)
     parser.add_argument('--data_set_path', type=str, default='./data')
@@ -69,11 +69,53 @@ transform = transforms.Compose([
 ])
 
 
+def split_image_and_label_with_overlap(image, label, overlap=5):
+    """
+    Split image (B, C, H, W) and label (B, H, W) into two overlapping parts along longer dimension.
+
+    Args:
+        image: numpy.ndarray, shape (B, C, H, W)
+        label: numpy.ndarray, shape (B, H, W)
+        overlap: int, overlap size in pixels, set as 5 by default
+
+    Returns:
+        image_parts: list of two numpy.ndarray, each shape (B, C, H', W')
+        label_parts: list of two numpy.ndarray, each shape (B, H', W')
+    """
+    B, C, H, W = image.shape
+    _, Hl, Wl = label.shape
+
+    assert B == label.shape[0], "Batch size of image and label must be equal"
+    assert H == Hl and W == Wl, "Image and label spatial dimensions must match"
+
+    if H >= W:
+        mid = H // 2
+        start_second = mid - overlap
+
+        image_part1 = image[:, :, :mid + overlap, :]
+        image_part2 = image[:, :, start_second:, :]
+
+        label_part1 = label[:, :mid + overlap, :]
+        label_part2 = label[:, start_second:, :]
+    else:
+        mid = W // 2
+        start_second = mid - overlap
+
+        image_part1 = image[:, :, :, :mid + overlap]
+        image_part2 = image[:, :, :, start_second:]
+
+        label_part1 = label[:, :, :mid + overlap]
+        label_part2 = label[:, :, start_second:]
+
+    return image_part1, image_part2, label_part1, label_part2
+
+
 if __name__ == '__main__':
     args = get_parser()
 
-    seed_list = [0,1,2,3,4,5,6,7,8,9]  #
-    # seed_list = [0, 1]  #
+    # seed_list = [0,1,2,3,4,5,6,7,8,9]  #
+    seed_list = [0, 1, 2, 3, 4]  #
+    # seed_list = [9]
 
     num_list = [args.train_samples, args.val_samples]
 
@@ -85,10 +127,10 @@ if __name__ == '__main__':
                 'lr':args.learning_rate, 'seed_list':seed_list}
 
                         # 0        1         2         3        4
-    data_set_name_list = ['UP', 'HanChuan', 'HongHu', 'Houston']
+    data_set_name_list = ['UP', 'HanChuan', 'HongHu', 'Houston', 'IndianPines']
     data_set_name = data_set_name_list[dataset_index]
 
-    if data_set_name in ['HanChuan', 'Houston'] and net_name == ("MambaHSI" or "SpatialMambaHSI"):
+    if data_set_name in ['Houston'] and net_name in ["MambaHSI", "SpatialMambaHSI", "MambaVisionHSI"]:
         split_image = True
     else:
         split_image = False 
@@ -112,7 +154,7 @@ if __name__ == '__main__':
     # load data
     data_set_path = args.data_set_path
     data, gt = data_load_operate.load_data(data_set_name, data_set_path)
-    logger.info('The shape of image data: %s', data.shape) # HWC
+    logger.info('The shape of image data (HWC): %s', data.shape) # HWC
     height, width, channels = data.shape
     img = ImageStretching(data)
     logger.info('The shape of gt: %s', gt.shape) # HW
@@ -168,12 +210,13 @@ if __name__ == '__main__':
             require_resize = False
         elif net_name == "MambaHSI":
             net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
-            require_resize = True
         elif net_name == "SpatialMambaHSI":
-            use_down_sample = args.use_down_sample
             net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, depth=args.depth,
-                                  hidden_dim=args.hidden_dim, down_sample=use_down_sample)
-            require_resize = True if use_down_sample else False
+                                  hidden_dim=args.hidden_dim, group_num=4)
+        elif net_name == "MambaVisionHSI":
+            net = MambaVisionHSI(in_channels=channels, depth=[1, 1, 2, 2], head=[1, 4, 8, 8],
+                                  hidden_dim=args.hidden_dim, num_classes=class_count, group_num=128, window_size=[3, 3, 4, 4], 
+                                  linear_patch_embedding=False)
         elif net_name == "MambaUNetHSI":
             net = MambaUNetHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim, scale_num=args.scale_num)
             require_resize = False
@@ -182,9 +225,8 @@ if __name__ == '__main__':
         net.to(device)
         logger.info(paras_dict)
         # logger.info(net)
-        x = transform(np.array(img)) # B C H W?
-        x = x.unsqueeze(0).float().to(device)
-
+        x = transform(np.array(img)) # C H W
+        x = x.unsqueeze(0).float().to(device) # B(=1) C H W
         # ############################################
         # val_label = test_label
         # ############################################
@@ -201,13 +243,13 @@ if __name__ == '__main__':
         if args.record_computecost:
             net.eval()
             flops, macs1, para = calculate_flops(model=net, input_shape=(1, x.shape[1], x.shape[2], x.shape[3]))
-            logger.info("para:{}\n,flops:{}".format(para, flops))
+            logger.info("para:{}\n, flops:{}".format(para, flops))
 
         tic1 = time.perf_counter()
         best_val_acc = 0
         # train loop
         tqdm_object = tqdm(range(args.max_epoch), total=args.max_epoch, leave=False, desc='Train Iter'.rjust(10), colour="blue")
-        for epoch, batch in enumerate(tqdm_object):
+        for epoch, _ in enumerate(tqdm_object):
             y_train = train_label.unsqueeze(0)
             train_acc_sum, trained_samples_counter = 0.0, 0
             batch_counter, train_loss_sum = 0, 0
@@ -215,32 +257,26 @@ if __name__ == '__main__':
             loss_dict = {}
 
             net.train()
-            # To avoid the OOM due to the large input image size
+
+            # to avoid the OOM due to the large input image size
             if split_image:
-                x_part1 = x[:, :, :x.shape[2] // 2 + 5, :]
-                y_part1 = y_train[:, :x.shape[2] // 2 + 5, :]
-                x_part2 = x[:, :, x.shape[2] // 2 - 5: , :]
-                y_part2 = y_train[:, x.shape[2] // 2 - 5:, :]
-                logger.info('The shape of part1 of x: {}'.format(x_part1.shape))
-                logger.info('The shape of part2 of x: {}'.format(x_part2.shape))
-                
-                y_pred_part1 = net(x_part1)
-                ls1 = head_loss(loss_func, y_pred_part1, y_part1.long(), require_resize=require_resize)
+                # require the shape of x is (batch, channels, height, width)
+                x_part1, x_part2, y_part1, y_part2 = split_image_and_label_with_overlap(x, y_train)
+                # training each part
+                losses = []
                 optimizer.zero_grad()
-                ls1.backward()
+                for i, (x_part, y_part) in enumerate(zip([x_part1, x_part2], [y_part1, y_part2]), start=1):
+                    y_pred = net(x_part)
+                    loss = head_loss(loss_func, y_pred, y_part.long(), require_resize=require_resize)
+                    loss.backward()
+                    losses.append(loss) # Store each loss
+
                 optimizer.step()
                 torch.cuda.empty_cache()
-
-                y_pred_part2 = net(x_part2)
-                ls2 = head_loss(loss_func, y_pred_part2, y_part2.long(), require_resize=require_resize)
-                optimizer.zero_grad()
-                ls2.backward()
-                optimizer.step()
-                torch.cuda.empty_cache()
-
-                # logger.info('Iter:{}|loss:{}'.format(epoch, (ls1 + ls2).detach().cpu().numpy()))
-                writer.add_scalar(f"Loss/{args.net_name}", (ls1 + ls2).detach().cpu().numpy(), epoch)
-                tqdm_object.set_postfix(train_loss=(ls1 + ls2).detach().cpu().numpy())
+                # sum up all losses
+                total_loss = sum(loss.detach().cpu().numpy() for loss in losses)
+                writer.add_scalar(f"Train/Loss", total_loss, epoch)
+                tqdm_object.set_postfix(train_loss=total_loss)
             else:
                 y_pred = net(x)
                 ls = head_loss(loss_func, y_pred, y_train.long(), require_resize=require_resize)
@@ -248,7 +284,7 @@ if __name__ == '__main__':
                 ls.backward()
                 optimizer.step()
                 # logger.info('Iter:{}|loss:{}'.format(epoch, ls.detach().cpu().numpy()))
-                writer.add_scalar(f"Loss/{args.net_name}", ls.detach().cpu().numpy(), epoch)
+                writer.add_scalar(f"Train/Loss", ls.detach().cpu().numpy(), epoch)
                 tqdm_object.set_postfix(train_loss=ls.detach().cpu().numpy())
                 torch.cuda.empty_cache()
 
@@ -275,6 +311,10 @@ if __name__ == '__main__':
                     mAcc, Acc = evaluator.Pixel_Accuracy_Class()
                     Kappa = evaluator.Kappa()
                     logger.info('Evaluate {}|OA:{}|MACC:{}|Kappa:{}|MIOU:{}\n|IOU:{}\n|ACC:{}'.format(epoch, OA, mAcc, Kappa, mIOU, IOU, Acc))
+                    writer.add_scalar(f"Train/OA", OA, epoch)
+                    writer.add_scalar(f"Train/mAcc", mAcc, epoch)
+                    writer.add_scalar(f"Train/Kappa", Kappa, epoch)
+                    writer.add_scalar(f"Train/mIOU", mIOU, epoch)
                     # save weight
                     if OA >= best_val_acc:
                         best_epoch = epoch + 1
@@ -298,8 +338,10 @@ if __name__ == '__main__':
         elif net_name == "MambaHSI":
             best_net = MambaHSI(in_channels=channels, num_classes=class_count, hidden_dim=args.hidden_dim)
         elif net_name == "SpatialMambaHSI":
-            best_net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, depth=args.depth,
-                                  hidden_dim=args.hidden_dim, down_sample=use_down_sample)
+            best_net = SpatialMambaHSI(in_channels=channels, num_classes=class_count, depth=args.depth, hidden_dim=args.hidden_dim)
+        elif net_name == "MambaVisionHSI":
+            best_net = MambaVisionHSI(in_channels=channels, num_classes=class_count, depth=args.depth,
+                                  hidden_dim=args.hidden_dim, down_sample=args.use_down_sample)
         elif net_name == "MambaUNetHSI":
             best_net = MambaUNetHSI(in_channels=channels, num_classes=class_count, 
                                  hidden_dim=args.hidden_dim, scale_num=args.scale_num)
@@ -409,5 +451,3 @@ if __name__ == '__main__':
         np.round(np.std(Test_Time_ALL) * 100, decimals=3))
     f.write(str_results)
     f.close()
-
-    del net
